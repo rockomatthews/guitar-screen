@@ -1,6 +1,18 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <AppleMIDI.h>
+
+// WiFi settings - CHANGE THESE
+const char *ssid = "A202";
+const char *pass = "VUah5EA9";
+
+// MIDI settings
+#define MIDI_CC_X 22     // CC number for X position
+#define MIDI_CC_Y 23     // CC number for Y position
+#define MIDI_CC_TOUCH 24 // CC number for touch state
+#define MIDI_CHANNEL 1   // MIDI channel to send on
 
 // Keep screen black
 #define TFT_CS 5
@@ -38,12 +50,18 @@
 #define LED_B 17     // RGB LED - Blue
 #define BACKLIGHT 27 // Display backlight
 
+// Tracking connection state
+bool isConnected = false;
+
+// Create an instance of the AppleMIDI interface
+APPLEMIDI_CREATE_INSTANCE(WiFiUDP, AppleMIDI, "ESP32-Touch", 5004);
+
 void setup()
 {
   // Initialize serial
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\nESP32-3248S035C Touch Test");
+  Serial.println("\nESP32-3248S035C Touch MIDI Controller");
 
   // Configure display pins for black screen
   pinMode(TFT_CS, OUTPUT);
@@ -139,19 +157,67 @@ void setup()
     Serial.println("No I2C devices found");
   }
 
-  // Blink green LED to indicate ready
-  digitalWrite(LED_G, LOW);
-  delay(200);
-  digitalWrite(LED_G, HIGH);
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi ");
+  Serial.println(ssid);
 
-  Serial.println("\nREADY TO TEST TOUCHSCREEN");
-  Serial.println("Touch the screen to see coordinates");
+  WiFi.begin(ssid, pass);
+
+  // Wait for connection (with timeout)
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20)
+  {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println();
+    Serial.print("WiFi connected - IP address: ");
+    Serial.println(WiFi.localIP());
+
+    // Blink green LED to indicate WiFi connection
+    digitalWrite(LED_G, LOW);
+    delay(200);
+    digitalWrite(LED_G, HIGH);
+  }
+  else
+  {
+    Serial.println();
+    Serial.println("WiFi connection failed!");
+
+    // Blink red LED to indicate WiFi failure
+    for (int i = 0; i < 3; i++)
+    {
+      digitalWrite(LED_R, LOW);
+      delay(200);
+      digitalWrite(LED_R, HIGH);
+      delay(200);
+    }
+  }
+
+  Serial.println("OK, now make sure you have an rtpMIDI session that is Enabled");
+  Serial.print("Add device named ESP32-Touch with Host/Port ");
+  Serial.print(WiFi.localIP());
+  Serial.println(":5004");
+  Serial.println("Then press the Connect button");
+  Serial.println("Then open a MIDI listener and monitor incoming MIDI commands");
+
+  Serial.println("\nREADY TO TEST TOUCHSCREEN MIDI");
+  Serial.println("Touch the screen to send MIDI Control Changes");
 }
 
 void loop()
 {
+  // Process incoming MIDI messages
+  AppleMIDI.read();
+
   static unsigned long lastTouchCheck = 0;
   static bool wasTouch = false;
+  static uint8_t lastX = 0;
+  static uint8_t lastY = 0;
 
   // Check for touch input every 20ms
   if (millis() - lastTouchCheck > 20)
@@ -190,7 +256,31 @@ void loop()
           uint16_t x = xLow | (xHigh << 8);
           uint16_t y = yLow | (yHigh << 8);
 
-          Serial.printf("Touch detected: X=%d, Y=%d\n", x, y);
+          // Map touch coordinates to MIDI CC range (0-127)
+          uint8_t midiX = map(x, 0, SCREEN_WIDTH, 0, 127);
+          uint8_t midiY = map(y, 0, SCREEN_HEIGHT, 0, 127);
+
+          // Only send if value changed (to avoid flooding)
+          if (midiX != lastX)
+          {
+            AppleMIDI.sendControlChange(MIDI_CC_X, midiX, MIDI_CHANNEL);
+            lastX = midiX;
+          }
+
+          if (midiY != lastY)
+          {
+            AppleMIDI.sendControlChange(MIDI_CC_Y, midiY, MIDI_CHANNEL);
+            lastY = midiY;
+          }
+
+          // If this is a new touch, send touch state CC
+          if (!wasTouch)
+          {
+            AppleMIDI.sendControlChange(MIDI_CC_TOUCH, 127, MIDI_CHANNEL);
+            Serial.println("Touch ON - MIDI sent");
+          }
+
+          Serial.printf("Touch: X=%d, Y=%d (MIDI: %d, %d)\n", x, y, midiX, midiY);
 
           // Light up RGB LED based on touch position
           if (x < SCREEN_WIDTH / 3)
@@ -221,7 +311,11 @@ void loop()
         digitalWrite(LED_R, HIGH);
         digitalWrite(LED_G, HIGH);
         digitalWrite(LED_B, HIGH);
-        Serial.println("Touch released");
+
+        // Send touch off message
+        AppleMIDI.sendControlChange(MIDI_CC_TOUCH, 0, MIDI_CHANNEL);
+
+        Serial.println("Touch OFF - MIDI sent");
         wasTouch = false;
       }
 
